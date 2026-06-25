@@ -51,13 +51,38 @@ static bool create_overlay_window(android::detail::Functionals& fn,
     LOGI("SurfaceComposerClient constructed");
 
     // --- 2. 获取显示 Token ---
-    if (!fn.SurfaceComposerClient__GetInternalDisplayToken) {
-        LOGE("GetInternalDisplayToken not resolved");
-        return false;
+    // 优先使用 getInternalDisplayToken()，如果不支持则尝试 getPhysicalDisplayIds()
+    android::detail::StrongPointer<void> displayToken;
+    bool haveToken = false;
+
+    if (fn.SurfaceComposerClient__GetInternalDisplayToken) {
+        displayToken = fn.SurfaceComposerClient__GetInternalDisplayToken();
+        if (displayToken) {
+            LOGI("Got display token via getInternalDisplayToken");
+            haveToken = true;
+        } else {
+            LOGE("getInternalDisplayToken returned null");
+        }
     }
-    auto displayToken = fn.SurfaceComposerClient__GetInternalDisplayToken();
-    if (!displayToken) {
-        LOGE("Failed to get internal display token");
+
+    // 备选方案：通过物理显示 ID 获取令牌
+    if (!haveToken && fn.SurfaceComposerClient__GetPhysicalDisplayIds) {
+        LOGI("Trying getPhysicalDisplayIds...");
+        auto ids = fn.SurfaceComposerClient__GetPhysicalDisplayIds();
+        if (!ids.empty()) {
+            LOGI("Found %zu physical displays", ids.size());
+            displayToken = fn.SurfaceComposerClient__GetPhysicalDisplayToken(ids[0]);
+            if (displayToken) {
+                LOGI("Got display token via getPhysicalDisplayToken(0)");
+                haveToken = true;
+            }
+        } else {
+            LOGE("getPhysicalDisplayIds returned empty list");
+        }
+    }
+
+    if (!haveToken) {
+        LOGE("All methods to get display token failed. Exiting.");
         return false;
     }
 
@@ -67,11 +92,15 @@ static bool create_overlay_window(android::detail::Functionals& fn,
         fn.SurfaceComposerClient__GetDisplayInfo(displayToken, &dispInfo);
         LOGI("DisplayInfo: %ux%u, fps=%.1f, density=%.1f",
              dispInfo.w, dispInfo.h, dispInfo.fps, dispInfo.density);
+        // 如果 DisplayInfo 返回了 0x0 的尺寸，尝试用 ANativeWindow 查询
+        if (dispInfo.w == 0 || dispInfo.h == 0) {
+            LOGE("DisplayInfo returned 0 size, will use fallback");
+        }
     } else {
-        LOGE("GetDisplayInfo not available, using defaults");
-        dispInfo.w = 1080;
-        dispInfo.h = 1920;
+        LOGE("GetDisplayInfo not resolved, using defaults");
     }
+    if (dispInfo.w == 0) dispInfo.w = 1080;
+    if (dispInfo.h == 0) dispInfo.h = 1920;
 
     outW = dispInfo.w;
     outH = dispInfo.h;
