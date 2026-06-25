@@ -10,12 +10,28 @@
 #include <string>
 #include <vector>
 
-#define ResolveMethod(ClassName, MethodName, Handle, MethodSignature)                                                                    \
-    ClassName##__##MethodName = reinterpret_cast<decltype(ClassName##__##MethodName)>(symbolMethod.Find(Handle, MethodSignature));       \
-    if (nullptr == ClassName##__##MethodName)                                                                                            \
-    {                                                                                                                                    \
-        __android_log_print(ANDROID_LOG_ERROR, "ImGui", "[-] Method not found: %s -> %s::%s", MethodSignature, #ClassName, #MethodName); \
-    }
+// 尝试两种命名空间解析符号：先在 android:: 下找，找不到则在 android::gui:: 下找
+#define ResolveMethodDual(ClassName, MethodName, Handle, AndroidSig)                   \
+    do {                                                                               \
+        ClassName##__##MethodName = reinterpret_cast<decltype(ClassName##__##MethodName)>( \
+            symbolMethod.Find(Handle, AndroidSig));                                    \
+        if (nullptr == ClassName##__##MethodName) {                                    \
+            /* 尝试 android::gui:: 命名空间 (AOSP 16+) */                              \
+            std::string guiSig = AndroidSig;                                           \
+            /* "7android" + 类名长度数字 => "7android3gui" + 类名长度数字 */           \
+            size_t pos = guiSig.find("7android");                                      \
+            if (pos != std::string::npos) {                                            \
+                guiSig.insert(pos + 8, "3gui");                                        \
+                ClassName##__##MethodName = reinterpret_cast<decltype(ClassName##__##MethodName)>( \
+                    symbolMethod.Find(Handle, guiSig.c_str()));                        \
+            }                                                                          \
+        }                                                                              \
+        if (nullptr == ClassName##__##MethodName) {                                    \
+            __android_log_print(ANDROID_LOG_ERROR, "ImGui",                            \
+                "[-] Method not found (both namespaces): %s::%s",                      \
+                #ClassName, #MethodName);                                              \
+        }                                                                              \
+    } while(0)
 
 namespace android {
     namespace detail {
@@ -137,6 +153,48 @@ namespace android {
                     return;
                 }
 
+#ifdef __LP64__
+                auto libgui   = symbolMethod.Open("/system/lib64/libgui.so", RTLD_LAZY);
+                auto libutils = symbolMethod.Open("/system/lib64/libutils.so", RTLD_LAZY);
+#else
+                auto libgui   = symbolMethod.Open("/system/lib/libgui.so", RTLD_LAZY);
+                auto libutils = symbolMethod.Open("/system/lib/libutils.so", RTLD_LAZY);
+#endif
+                // libutils (RefBase + String8) — 命名空间不变
+                ResolveMethodDual(RefBase, IncStrong, libutils, "_ZNK7android7RefBase9incStrongEPKv");
+                ResolveMethodDual(RefBase, DecStrong, libutils, "_ZNK7android7RefBase9decStrongEPKv");
+                ResolveMethodDual(String8, Constructor, libutils, "_ZN7android7String8C2EPKc");
+                ResolveMethodDual(String8, Destructor, libutils, "_ZN7android7String8D2Ev");
+
+                // libgui SurfaceComposerClient 方法 (自动尝试 android:: 和 android::gui::)
+                ResolveMethodDual(SurfaceComposerClient, Constructor, libgui, "_ZN7android21SurfaceComposerClientC2Ev");
+                ResolveMethodDual(LayerMetadata, Constructor, libgui, "_ZN7android13LayerMetadataC2Ev");
+                ResolveMethodDual(LayerMetadata, setInt32, libgui, "_ZN7android13LayerMetadata8setInt32Eji");
+                ResolveMethodDual(SurfaceComposerClient, CreateSurface, libgui,
+                    "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjijRKNS_2spINS_7IBinderEEENS_13LayerMetadataEPj");
+                ResolveMethodDual(SurfaceComposerClient, GetInternalDisplayToken, libgui,
+                    "_ZN7android21SurfaceComposerClient23getInternalDisplayTokenEv");
+                ResolveMethodDual(SurfaceComposerClient, GetDisplayState, libgui,
+                    "_ZN7android21SurfaceComposerClient15getDisplayStateERKNS_2spINS_7IBinderEEEPNS_2ui12DisplayStateE");
+                ResolveMethodDual(SurfaceComposerClient, GetDisplayInfo, libgui,
+                    "_ZN7android21SurfaceComposerClient14getDisplayInfoERKNS_2spINS_7IBinderEEEPNS_2ui11DisplayInfoE");
+                ResolveMethodDual(SurfaceComposerClient, GetPhysicalDisplayIds, libgui,
+                    "_ZN7android21SurfaceComposerClient21getPhysicalDisplayIdsEv");
+                ResolveMethodDual(SurfaceComposerClient, GetPhysicalDisplayToken, libgui,
+                    "_ZN7android21SurfaceComposerClient23getPhysicalDisplayTokenENS_17PhysicalDisplayIdE");
+                ResolveMethodDual(SurfaceComposerClient__Transaction, Constructor, libgui,
+                    "_ZN7android21SurfaceComposerClient11TransactionC2Ev");
+                ResolveMethodDual(SurfaceComposerClient__Transaction, SetLayer, libgui,
+                    "_ZN7android21SurfaceComposerClient11Transaction8setLayerERKNS_2spINS_14SurfaceControlEEEi");
+                ResolveMethodDual(SurfaceComposerClient__Transaction, SetTrustedOverlay, libgui,
+                    "_ZN7android21SurfaceComposerClient11Transaction17setTrustedOverlayERKNS_2spINS_14SurfaceControlEEEb");
+                ResolveMethodDual(SurfaceComposerClient__Transaction, Apply, libgui,
+                    "_ZN7android21SurfaceComposerClient11Transaction5applyEbb");
+                ResolveMethodDual(SurfaceControl, Validate, libgui, "_ZNK7android14SurfaceControl8validateEv");
+                ResolveMethodDual(SurfaceControl, GetSurface, libgui, "_ZN7android14SurfaceControl10getSurfaceEv");
+                ResolveMethodDual(SurfaceControl, DisConnect, libgui, "_ZN7android14SurfaceControl10disconnectEv");
+
+                // 尝试 patchesTable (旧版本兼容)
                 static std::unordered_map<size_t, std::unordered_map<void**, const char*>> patchesTable = {
                     {15, {
                         {reinterpret_cast<void**>(&LayerMetadata__Constructor),
@@ -152,83 +210,12 @@ namespace android {
                         {reinterpret_cast<void**>(&SurfaceComposerClient__CreateSurface),
                          "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjiiRKNS_2spINS_7IBinderEEENS_3gui13LayerMetadataEPj"},
                     }},
-                    {12, {
-                        {reinterpret_cast<void**>(&SurfaceComposerClient__Transaction__Apply),
-                         "_ZN7android21SurfaceComposerClient11Transaction5applyEb"},
-                    }},
-                    {11, {
-                        {reinterpret_cast<void**>(&SurfaceComposerClient__CreateSurface),
-                         "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjijPNS_14SurfaceControlENS_13LayerMetadataEPj"},
-                        {reinterpret_cast<void**>(&SurfaceControl__GetSurface),
-                         "_ZNK7android14SurfaceControl10getSurfaceEv"},
-                    }},
-                    {10, {
-                        {reinterpret_cast<void**>(&SurfaceComposerClient__CreateSurface),
-                         "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjijPNS_14SurfaceControlENS_13LayerMetadataE"},
-                        {reinterpret_cast<void**>(&SurfaceControl__GetSurface),
-                         "_ZNK7android14SurfaceControl10getSurfaceEv"},
-                    }},
-                    {9, {
-                        {reinterpret_cast<void**>(&SurfaceComposerClient__CreateSurface),
-                         "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjijPNS_14SurfaceControlEii"},
-                        {reinterpret_cast<void**>(&SurfaceComposerClient__GetBuiltInDisplay),
-                         "_ZN7android21SurfaceComposerClient17getBuiltInDisplayEi"},
-                        {reinterpret_cast<void**>(&SurfaceControl__GetSurface),
-                         "_ZNK7android14SurfaceControl10getSurfaceEv"},
-                    }},
-                    {8, {
-                        {reinterpret_cast<void**>(&SurfaceComposerClient__CreateSurface),
-                         "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjijPNS_14SurfaceControlEjj"},
-                        {reinterpret_cast<void**>(&SurfaceComposerClient__GetBuiltInDisplay),
-                         "_ZN7android21SurfaceComposerClient17getBuiltInDisplayEi"},
-                        {reinterpret_cast<void**>(&SurfaceControl__GetSurface),
-                         "_ZNK7android14SurfaceControl10getSurfaceEv"},
-                    }},
                 };
-
-#ifdef __LP64__
-                auto libgui   = symbolMethod.Open("/system/lib64/libgui.so", RTLD_LAZY);
-                auto libutils = symbolMethod.Open("/system/lib64/libutils.so", RTLD_LAZY);
-#else
-                auto libgui   = symbolMethod.Open("/system/lib/libgui.so", RTLD_LAZY);
-                auto libutils = symbolMethod.Open("/system/lib/libutils.so", RTLD_LAZY);
-#endif
-                ResolveMethod(RefBase, IncStrong, libutils, "_ZNK7android7RefBase9incStrongEPKv");
-                ResolveMethod(RefBase, DecStrong, libutils, "_ZNK7android7RefBase9decStrongEPKv");
-                ResolveMethod(String8, Constructor, libutils, "_ZN7android7String8C2EPKc");
-                ResolveMethod(String8, Destructor, libutils, "_ZN7android7String8D2Ev");
-                ResolveMethod(LayerMetadata, Constructor, libgui, "_ZN7android13LayerMetadataC2Ev");
-                ResolveMethod(LayerMetadata, setInt32, libgui, "_ZN7android13LayerMetadata8setInt32Eji");
-                ResolveMethod(SurfaceComposerClient, Constructor, libgui, "_ZN7android21SurfaceComposerClientC2Ev");
-                // Primary signature (AOSP 14+)
-                ResolveMethod(SurfaceComposerClient, CreateSurface, libgui,
-                    "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjijRKNS_2spINS_7IBinderEEENS_13LayerMetadataEPj");
                 if (SurfaceComposerClient__CreateSurface == nullptr && patchesTable.find(systemVersion) != patchesTable.end()) {
                     for (const auto& [patchTo, signature] : patchesTable.at(systemVersion)) {
                         *patchTo = symbolMethod.Find(libgui, signature);
                     }
                 }
-                ResolveMethod(SurfaceComposerClient, GetInternalDisplayToken, libgui,
-                    "_ZN7android21SurfaceComposerClient23getInternalDisplayTokenEv");
-                ResolveMethod(SurfaceComposerClient, GetDisplayState, libgui,
-                    "_ZN7android21SurfaceComposerClient15getDisplayStateERKNS_2spINS_7IBinderEEEPNS_2ui12DisplayStateE");
-                ResolveMethod(SurfaceComposerClient, GetDisplayInfo, libgui,
-                    "_ZN7android21SurfaceComposerClient14getDisplayInfoERKNS_2spINS_7IBinderEEEPNS_11DisplayInfoE");
-                ResolveMethod(SurfaceComposerClient, GetPhysicalDisplayIds, libgui,
-                    "_ZN7android21SurfaceComposerClient21getPhysicalDisplayIdsEv");
-                ResolveMethod(SurfaceComposerClient, GetPhysicalDisplayToken, libgui,
-                    "_ZN7android21SurfaceComposerClient23getPhysicalDisplayTokenENS_17PhysicalDisplayIdE");
-                ResolveMethod(SurfaceComposerClient__Transaction, Constructor, libgui,
-                    "_ZN7android21SurfaceComposerClient11TransactionC2Ev");
-                ResolveMethod(SurfaceComposerClient__Transaction, SetLayer, libgui,
-                    "_ZN7android21SurfaceComposerClient11Transaction8setLayerERKNS_2spINS_14SurfaceControlEEEi");
-                ResolveMethod(SurfaceComposerClient__Transaction, SetTrustedOverlay, libgui,
-                    "_ZN7android21SurfaceComposerClient11Transaction17setTrustedOverlayERKNS_2spINS_14SurfaceControlEEEb");
-                ResolveMethod(SurfaceComposerClient__Transaction, Apply, libgui,
-                    "_ZN7android21SurfaceComposerClient11Transaction5applyEbb");
-                ResolveMethod(SurfaceControl, Validate, libgui, "_ZNK7android14SurfaceControl8validateEv");
-                ResolveMethod(SurfaceControl, GetSurface, libgui, "_ZN7android14SurfaceControl10getSurfaceEv");
-                ResolveMethod(SurfaceControl, DisConnect, libgui, "_ZN7android14SurfaceControl10disconnectEv");
             }
         };
     }
