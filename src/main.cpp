@@ -17,9 +17,6 @@
 
 #include "ANativeWindowCreator.h"
 
-// ============================================================
-// 日志宏
-// ============================================================
 #define LOGI(fmt, ...) fprintf(stdout, "[ImGui] " fmt "\n", ##__VA_ARGS__)
 #define LOGE(fmt, ...) fprintf(stderr, "[ImGui] " fmt "\n", ##__VA_ARGS__)
 
@@ -30,157 +27,180 @@ static EGLDisplay  egl_disp  = EGL_NO_DISPLAY;
 static EGLContext  egl_ctx   = EGL_NO_CONTEXT;
 static EGLSurface  egl_surf  = EGL_NO_SURFACE;
 static ANativeWindow* g_window = nullptr;
+static uint32_t fb_width  = 0;
+static uint32_t fb_height = 0;
 
 // ============================================================
-// SurfaceFlinger -> ANativeWindow 创建
+// SurfaceFlinger -> ANativeWindow 创建（使用 FunctionTable）
 // ============================================================
-static bool create_overlay_window(android::detail::Functionals& fn,
-                                   uint32_t& outW, uint32_t& outH)
-{
-    // --- 1. SurfaceComposerClient ---
-    // 分配足够大的内存，调用构造函数
-    char clientBuf[2048];
-    memset(clientBuf, 0, sizeof(clientBuf));
-    auto* scc = reinterpret_cast<void*>(clientBuf);
+static bool create_overlay_window(FunctionTable& fn) {
+    // --- 1. 在栈上构造 SurfaceComposerClient ---
+    char clientBuf[1024] = {0};
+    void* scc = (void*)clientBuf;
 
-    if (!fn.SurfaceComposerClient__Constructor) {
-        LOGE("SurfaceComposerClient::Constructor not resolved");
+    if (!fn.SCC_Construct) {
+        LOGE("SCC_Construct not resolved");
         return false;
     }
-    fn.SurfaceComposerClient__Constructor(scc);
+    fn.SCC_Construct(scc);
     LOGI("SurfaceComposerClient constructed");
 
     // --- 2. 获取显示 Token ---
-    // 优先使用 getInternalDisplayToken()，如果不支持则尝试 getPhysicalDisplayIds()
-    android::detail::StrongPointer<void> displayToken;
     bool haveToken = false;
+    char tokenBuf[64] = {0};
 
-    if (fn.SurfaceComposerClient__GetInternalDisplayToken) {
-        displayToken = fn.SurfaceComposerClient__GetInternalDisplayToken();
-        if (displayToken) {
-            LOGI("Got display token via getInternalDisplayToken");
-            haveToken = true;
-        } else {
-            LOGE("getInternalDisplayToken returned null");
-        }
-    }
+    auto getToken = [&](const char* method) -> bool {
+        // 这里需要一个合适大小的结构来接收 IBinder
+        // 实际上 GetInternalDisplayToken 返回的是 sp<IBinder>
+        // 但在栈上构造太复杂，改用指针
+        return false;
+    };
 
-    // 备选方案：通过物理显示 ID 获取令牌
-    if (!haveToken && fn.SurfaceComposerClient__GetPhysicalDisplayIds) {
-        LOGI("Trying getPhysicalDisplayIds...");
-        auto ids = fn.SurfaceComposerClient__GetPhysicalDisplayIds();
+    // 使用 getPhysicalDisplayIds + getPhysicalDisplayToken
+    if (fn.SCC_GetPhysicalDisplayIds && fn.SCC_GetPhysicalDisplayToken) {
+        // 注意：GetPhysicalDisplayIds 返回 vector<PhysicalDisplayId>
+        // 我们需要调用它并获取返回的数组
+        // 这里使用 reinterpret_cast 技巧：调用返回 vector 的函数
+        typedef std::vector<stub::PhysicalDisplayId> (*GetIdsFunc)();
+        auto getIds = reinterpret_cast<GetIdsFunc>(fn.SCC_GetPhysicalDisplayIds);
+        auto ids = getIds();
+
         if (!ids.empty()) {
-            LOGI("Found %zu physical displays", ids.size());
-            displayToken = fn.SurfaceComposerClient__GetPhysicalDisplayToken(ids[0]);
-            if (displayToken) {
-                LOGI("Got display token via getPhysicalDisplayToken(0)");
+            LOGI("Found %zu physical display(s)", ids.size());
+
+            stub::PhysicalDisplayId id0 = ids[0];
+            // getPhysicalDisplayToken(uint64_t) -> sp<IBinder>
+            typedef stub::StrongPointer<void> (*GetTokenFunc)(uint64_t);
+            auto getToken = reinterpret_cast<GetTokenFunc>(fn.SCC_GetPhysicalDisplayToken);
+            auto tokenSP = getToken(id0.value);
+
+            if (tokenSP) {
+                LOGI("Got display token via getPhysicalDisplayToken");
                 haveToken = true;
+
+                // --- 3. 获取显示信息 ---
+                stub::DisplayInfo dinfo = {0};
+                if (fn.SCC_GetDisplayInfo) {
+                    // GetDisplayInfo(const sp<IBinder>&, DisplayInfo*)
+                    // 第一个参数是 const sp<IBinder>&，即 const StrongPointer<IBinder>&
+                    typedef int32_t (*GetInfoFunc)(void* /* const sp<IBinder>& */, void*);
+                    auto getInfo = reinterpret_cast<GetInfoFunc>(fn.SCC_GetDisplayInfo);
+                    int32_t ret = getInfo((void*)&tokenSP, (void*)&dinfo);
+                    LOGI("GetDisplayInfo returned %d: %ux%u", ret, dinfo.w, dinfo.h);
+                } else {
+                    LOGE("SCC_GetDisplayInfo not resolved");
+                }
+
+                fb_width  = dinfo.w > 0 ? dinfo.w : 1080;
+                fb_height = dinfo.h > 0 ? dinfo.h : 1920;
+                LOGI("Display resolution: %dx%d", fb_width, fb_height);
             }
         } else {
             LOGE("getPhysicalDisplayIds returned empty list");
         }
+    } else {
+        LOGE("GetPhysicalDisplayIds/Token not resolved");
     }
 
     if (!haveToken) {
-        LOGE("All methods to get display token failed. Exiting.");
+        // 尝试 getInternalDisplayToken
+        if (fn.SCC_GetInternalDisplayToken) {
+            typedef stub::StrongPointer<void> (*TokenFunc)();
+            auto getToken = reinterpret_cast<TokenFunc>(fn.SCC_GetInternalDisplayToken);
+            auto token = getToken();
+            if (token) {
+                LOGI("Got display token via getInternalDisplayToken");
+                haveToken = true;
+
+                stub::DisplayInfo dinfo = {0};
+                if (fn.SCC_GetDisplayInfo) {
+                    typedef int32_t (*GetInfoFunc)(void*, void*);
+                    auto getInfo = reinterpret_cast<GetInfoFunc>(fn.SCC_GetDisplayInfo);
+                    getInfo((void*)&token, (void*)&dinfo);
+                }
+                fb_width  = dinfo.w > 0 ? dinfo.w : 1080;
+                fb_height = dinfo.h > 0 ? dinfo.h : 1920;
+            }
+        }
+    }
+
+    if (!haveToken) {
+        LOGE("Failed to get display token via any method");
         return false;
     }
 
-    // --- 3. 获取显示信息 ---
-    android::detail::ui::DisplayInfo dispInfo = {};
-    if (fn.SurfaceComposerClient__GetDisplayInfo) {
-        fn.SurfaceComposerClient__GetDisplayInfo(displayToken, &dispInfo);
-        LOGI("DisplayInfo: %ux%u, fps=%.1f, density=%.1f",
-             dispInfo.w, dispInfo.h, dispInfo.fps, dispInfo.density);
-        // 如果 DisplayInfo 返回了 0x0 的尺寸，尝试用 ANativeWindow 查询
-        if (dispInfo.w == 0 || dispInfo.h == 0) {
-            LOGE("DisplayInfo returned 0 size, will use fallback");
-        }
-    } else {
-        LOGE("GetDisplayInfo not resolved, using defaults");
-    }
-    if (dispInfo.w == 0) dispInfo.w = 1080;
-    if (dispInfo.h == 0) dispInfo.h = 1920;
+    // --- 4. 创建 String8 ---
+    char str8Buf[128] = {0};
+    stub::String8* str8 = (stub::String8*)str8Buf;
+    if (fn.String8_Construct)
+        fn.String8_Construct(str8, "ImGuiOverlay");
 
-    outW = dispInfo.w;
-    outH = dispInfo.h;
-
-    // --- 4. 创建 String8 名称 ---
-    char nameBuf[128];
-    memset(nameBuf, 0, sizeof(nameBuf));
-    android::detail::String8* str8 = reinterpret_cast<android::detail::String8*>(nameBuf);
-    if (fn.String8__Constructor)
-        fn.String8__Constructor(str8, "ImGuiOverlay");
-
-    // --- 5. SurfaceControl 元数据 ---
-    char metaBuf[256];
-    memset(metaBuf, 0, sizeof(metaBuf));
-    auto* layerMeta = reinterpret_cast<void*>(metaBuf);
-    if (fn.LayerMetadata__Constructor)
-        fn.LayerMetadata__Constructor(layerMeta);
-    // 设置 Buffer 状态层
-    if (fn.LayerMetadata__setInt32)
-        fn.LayerMetadata__setInt32(layerMeta, 0, 1); // METADATA_BUFFER_STATE = 0, BUFFER_STATE_GRAPHICS_BUFFER = 1
+    // --- 5. LayerMetadata ---
+    char metaBuf[256] = {0};
+    if (fn.LayerMeta_Construct)
+        fn.LayerMeta_Construct(metaBuf);
+    if (fn.LayerMeta_SetInt32)
+        fn.LayerMeta_SetInt32(metaBuf, 0, 1);
 
     // --- 6. 创建 Surface ---
-    if (!fn.SurfaceComposerClient__CreateSurface) {
-        LOGE("CreateSurface not resolved");
+    if (!fn.SCC_CreateSurface) {
+        LOGE("SCC_CreateSurface not resolved");
         return false;
     }
 
     uint32_t transformHint = 0;
-    auto surfaceControlSP = fn.SurfaceComposerClient__CreateSurface(
-        scc,
-        str8,
-        dispInfo.w, dispInfo.h,
-        1,         // PIXEL_FORMAT_RGBA_8888
-        0x00000001, // ISurfaceComposerClient::eFXSurfaceBufferState
-        nullptr,    // parentHandle
-        layerMeta,
-        &transformHint
-    );
+    // CreateSurface 返回 sp<SurfaceControl>
+    typedef void* (*CreateSurfaceFunc)(void* self, void* name,
+        uint32_t w, uint32_t h, int32_t format, uint32_t flags,
+        void* parent, void* meta, uint32_t* hint);
+    auto createSurf = reinterpret_cast<CreateSurfaceFunc>(fn.SCC_CreateSurface);
+    void* scSP = createSurf(scc, str8, fb_width, fb_height,
+        1,  // PIXEL_FORMAT_RGBA_8888
+        1,  // ISurfaceComposerClient::eFXSurfaceBufferState
+        nullptr, metaBuf, &transformHint);
 
-    if (!surfaceControlSP) {
-        LOGE("createSurface failed - got null SurfaceControl");
+    if (!scSP) {
+        LOGE("createSurface returned null");
         return false;
     }
-    LOGI("SurfaceControl created, transform hint: %u", transformHint);
+    LOGI("SurfaceControl created");
 
-    // --- 7. 设置图层 ---
-    char txnBuf[512];
-    memset(txnBuf, 0, sizeof(txnBuf));
-    auto* txn = reinterpret_cast<void*>(txnBuf);
-    if (fn.SurfaceComposerClient__Transaction__Constructor)
-        fn.SurfaceComposerClient__Transaction__Constructor(txn);
+    // --- 7. 设置 Transaction ---
+    struct SurfaceControlDeleter {
+        stub::StrongPointer<void> sp;
+        char padding[192 - sizeof(stub::StrongPointer<void>)] = {0};
+    };
+    // scSP 是一个 StrongPointer<SurfaceControl>，它的地址就是 SurfaceControl 的地址
+    // 但是我们无法确定 StrongPointer 的布局，所以直接用原始指针
 
-    // 设置 Layer=INT32_MAX (最顶层)
-    if (fn.SurfaceComposerClient__Transaction__SetLayer)
-        fn.SurfaceComposerClient__Transaction__SetLayer(txn, surfaceControlSP, INT32_MAX);
+    char txnBuf[512] = {0};
+    if (fn.Txn_Construct)
+        fn.Txn_Construct(txnBuf);
 
-    // 设置 TrustedOverlay (Android 13+ 绕过 overlay 限制)
-    if (fn.SurfaceComposerClient__Transaction__SetTrustedOverlay)
-        fn.SurfaceComposerClient__Transaction__SetTrustedOverlay(txn, surfaceControlSP, true);
-
-    // Apply transaction
-    if (fn.SurfaceComposerClient__Transaction__Apply)
-        fn.SurfaceComposerClient__Transaction__Apply(txn, true, true);
+    if (fn.Txn_SetLayer)
+        fn.Txn_SetLayer(txnBuf, scSP, INT32_MAX);
+    if (fn.Txn_SetTrustedOverlay)
+        fn.Txn_SetTrustedOverlay(txnBuf, scSP, true);
+    if (fn.Txn_Apply)
+        fn.Txn_Apply(txnBuf, true, true);
 
     // --- 8. 获取 ANativeWindow ---
-    if (!fn.SurfaceControl__GetSurface) {
-        LOGE("GetSurface not resolved");
+    if (!fn.SC_GetSurface) {
+        LOGE("SC_GetSurface not resolved");
         return false;
     }
-    auto surfaceSP = fn.SurfaceControl__GetSurface(surfaceControlSP.get());
-    if (!surfaceSP) {
-        LOGE("GetSurface returned null");
+    typedef void* (*GetSurfFunc)(void*);
+    auto getSf = reinterpret_cast<GetSurfFunc>(fn.SC_GetSurface);
+    void* surface = getSf(scSP);
+
+    if (!surface) {
+        LOGE("SC_GetSurface returned null");
         return false;
     }
 
-    // android::Surface 可转换为 ANativeWindow
-    g_window = reinterpret_cast<ANativeWindow*>(surfaceSP.get());
+    g_window = reinterpret_cast<ANativeWindow*>(surface);
     ANativeWindow_acquire(g_window);
-
-    LOGI("ANativeWindow created: %p (%ux%u)", (void*)g_window, dispInfo.w, dispInfo.h);
+    LOGI("ANativeWindow: %p (%dx%d)", (void*)g_window, fb_width, fb_height);
     return true;
 }
 
@@ -204,7 +224,6 @@ static bool init_egl_with_window() {
     }
     LOGI("EGL version: %d.%d", major, minor);
 
-    // 选择 RGBA8888 + ES3 配置
     const EGLint attribs[] = {
         EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
         EGL_SURFACE_TYPE,    EGL_WINDOW_BIT,
@@ -222,14 +241,12 @@ static bool init_egl_with_window() {
         return false;
     }
 
-    // 创建窗口表面
     egl_surf = eglCreateWindowSurface(egl_disp, config, g_window, nullptr);
     if (egl_surf == EGL_NO_SURFACE) {
         LOGE("eglCreateWindowSurface failed: 0x%x", eglGetError());
         return false;
     }
 
-    // OpenGL ES 3.0 上下文
     EGLint ctxAttribs[] = {
         EGL_CONTEXT_CLIENT_VERSION, 3,
         EGL_NONE
@@ -241,7 +258,7 @@ static bool init_egl_with_window() {
     }
 
     eglMakeCurrent(egl_disp, egl_surf, egl_surf, egl_ctx);
-    LOGI("EGL + OpenGL ES 3.0 initialized with ANativeWindow surface");
+    LOGI("EGL + OpenGL ES 3.0 ready");
     return true;
 }
 
@@ -255,31 +272,23 @@ static void shutdown_egl() {
     egl_disp = EGL_NO_DISPLAY;
     egl_ctx  = EGL_NO_CONTEXT;
     egl_surf = EGL_NO_SURFACE;
-
     if (g_window) {
         ANativeWindow_release(g_window);
         g_window = nullptr;
     }
 }
 
-// ============================================================
-// 保存帧到 PPM (可选)
-// ============================================================
-static void save_frame_ppm(const char* filename, int w, int h) {
-    unsigned char* pixels = new unsigned char[w * h * 4];
-    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+static void save_frame_ppm(const char* filename) {
+    unsigned char* pixels = new unsigned char[fb_width * fb_height * 4];
+    glReadPixels(0, 0, fb_width, fb_height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
 
     FILE* f = fopen(filename, "wb");
-    if (!f) {
-        LOGE("Cannot write %s", filename);
-        delete[] pixels;
-        return;
-    }
+    if (!f) { LOGE("Cannot write %s", filename); delete[] pixels; return; }
 
-    fprintf(f, "P6\n%d %d\n255\n", w, h);
-    for (int y = h - 1; y >= 0; y--) {
-        for (int x = 0; x < w; x++) {
-            int idx = (y * w + x) * 4;
+    fprintf(f, "P6\n%d %d\n255\n", fb_width, fb_height);
+    for (int y = fb_height - 1; y >= 0; y--) {
+        for (int x = 0; x < fb_width; x++) {
+            int idx = (y * fb_width + x) * 4;
             fwrite(&pixels[idx + 0], 1, 1, f);
             fwrite(&pixels[idx + 1], 1, 1, f);
             fwrite(&pixels[idx + 2], 1, 1, f);
@@ -287,19 +296,18 @@ static void save_frame_ppm(const char* filename, int w, int h) {
     }
     fclose(f);
     delete[] pixels;
-    LOGI("Frame saved: %s (%dx%d)", filename, w, h);
+    LOGI("Frame saved: %s", filename);
 }
 
 // ============================================================
 // 主入口
 // ============================================================
 int main(int argc, char** argv) {
-    LOGI("Android ImGui Native Binary (Screen Overlay) starting...");
+    LOGI("Android ImGui Native Binary v2 (Screen Overlay) starting...");
     LOGI("Usage: %s [--frames N] [--dump-every N]", argv[0]);
 
-    int total_frames  = 0;   // 0 = infinite
-    int dump_interval = 0;   // 0 = no dump
-
+    int total_frames  = 0;
+    int dump_interval = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc)
             total_frames = atoi(argv[++i]);
@@ -308,35 +316,28 @@ int main(int argc, char** argv) {
     }
 
     // ============================================================
-    // 1. 解析 SurfaceFlinger 符号
+    // 1. 初始化 FunctionTable (自动解析符号)
     // ============================================================
-    android::detail::Functionals::SymbolMethod dl;
-    dl.Open  = dlopen;
-    dl.Find  = dlsym;
-    dl.Close = dlclose;
-
-    LOGI("Resolving SurfaceFlinger symbols (Android %zu)...", android::detail::Functionals(dl).systemVersion);
-    
-    // 这里创建 Functionals 实例会触发符号解析和打印日志
-    // 实际符号保存在 Functionals 对象中供后续使用
-    auto fn = android::detail::Functionals(dl);
-    LOGI("Symbol resolution complete (Android %zu)", fn.systemVersion);
+    LOGI("Initializing SurfaceFlinger symbols...");
+    FunctionTable fn;
+    if (!fn.Init()) {
+        LOGE("Failed to initialize FunctionTable");
+        return 1;
+    }
 
     // ============================================================
-    // 2. 创建 SurfaceFlinger 窗口
+    // 2. 创建 SurfaceFlinger 叠加窗口
     // ============================================================
-    uint32_t fb_width = 0, fb_height = 0;
-    if (!create_overlay_window(fn, fb_width, fb_height)) {
+    if (!create_overlay_window(fn)) {
         LOGE("Failed to create overlay window. Exiting.");
         return 1;
     }
-    LOGI("Overlay window created: %dx%d", fb_width, fb_height);
 
     // ============================================================
     // 3. 初始化 EGL
     // ============================================================
     if (!init_egl_with_window()) {
-        LOGE("Failed to initialize EGL with window. Exiting.");
+        LOGE("Failed to initialize EGL.");
         return 1;
     }
 
@@ -358,34 +359,30 @@ int main(int argc, char** argv) {
     // ============================================================
     // 5. 主渲染循环
     // ============================================================
-    LOGI("Starting render loop (frames=%s)...", 
+    LOGI("Render loop starting (frames=%s). Ctrl+C to stop.",
          total_frames > 0 ? std::to_string(total_frames).c_str() : "infinite");
-    LOGI("Press Ctrl+C on adb shell to stop.");
 
     ImVec4 clear_color = ImVec4(0.1f, 0.1f, 0.2f, 1.00f);
     int frame = 0;
 
     while (true) {
-        // 开始 ImGui 帧
         ImGui_ImplOpenGL3_NewFrame();
         ImGui::NewFrame();
 
-        // 示例演示窗口
+        // Demo + 信息窗口
         ImGui::ShowDemoWindow(NULL);
 
-        // 自定义窗口
-        ImGui::Begin("Android Screen Overlay");
-        ImGui::Text("ImGui rendering directly to screen via SurfaceFlinger!");
-        ImGui::Text("Resolution: %dx%d", fb_width, fb_height);
-        ImGui::Text("Frame: %d", frame + 1);
-        if (frame > 0) ImGui::Text("FPS: %.1f", io.Framerate);
+        ImGui::Begin("Android Screen Overlay v2");
+        ImGui::Text("ImGui on SurfaceFlinger overlay!");
+        ImGui::Text("Android %zu | Resolution: %dx%d",
+                     fn.androidVersion, fb_width, fb_height);
+        ImGui::Text("Frame: %d | FPS: %.1f", frame + 1,
+                     frame > 0 ? io.Framerate : 0.0f);
         ImGui::Separator();
         ImGui::Text("Method: SurfaceFlinger -> ANativeWindow -> EGL");
-        ImGui::Text("Symbols resolved from libgui.so at runtime");
-        ImGui::Text("No APK, no Activity, no JNI needed.");
+        ImGui::Text("No APK, No JNI. Needs root.");
         ImGui::End();
 
-        // 渲染
         ImGui::Render();
         glViewport(0, 0, fb_width, fb_height);
         glClearColor(clear_color.x, clear_color.y, clear_color.z, clear_color.w);
@@ -393,30 +390,21 @@ int main(int argc, char** argv) {
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
         eglSwapBuffers(egl_disp, egl_surf);
-
         frame++;
 
-        // 如果设置了 dump 间隔，保存帧到 /sdcard/
         if (dump_interval > 0 && frame % dump_interval == 0) {
             char fname[128];
             snprintf(fname, sizeof(fname), "/sdcard/overlay_%04d.ppm", frame);
-            save_frame_ppm(fname, fb_width, fb_height);
+            save_frame_ppm(fname);
         }
 
-        // 如果设置了总帧数，到达后退出
-        if (total_frames > 0 && frame >= total_frames) {
-            LOGI("Reached target frame count (%d). Exiting.", total_frames);
-            break;
-        }
+        if (total_frames > 0 && frame >= total_frames) break;
     }
 
-    // ============================================================
-    // 6. 清理
-    // ============================================================
     ImGui_ImplOpenGL3_Shutdown();
     ImGui::DestroyContext();
     shutdown_egl();
 
-    LOGI("Done. %d frames rendered to screen.", frame);
+    LOGI("Done. %d frames rendered.", frame);
     return 0;
 }
