@@ -11,6 +11,8 @@
 #include <vector>
 
 // 尝试两种命名空间解析符号：先在 android:: 下找，找不到则在 android::gui:: 下找
+// 注意：嵌套类型（String8, LayerMetadata, IBinder 等）的命名空间也会变化，
+// 因此需要将符号名中所有 "7android" 都替换为 "7android3gui"
 #define ResolveMethodDual(ClassName, MethodName, Handle, AndroidSig)                   \
     do {                                                                               \
         ClassName##__##MethodName = reinterpret_cast<decltype(ClassName##__##MethodName)>( \
@@ -18,13 +20,14 @@
         if (nullptr == ClassName##__##MethodName) {                                    \
             /* 尝试 android::gui:: 命名空间 (AOSP 16+) */                              \
             std::string guiSig = AndroidSig;                                           \
-            /* "7android" + 类名长度数字 => "7android3gui" + 类名长度数字 */           \
-            size_t pos = guiSig.find("7android");                                      \
-            if (pos != std::string::npos) {                                            \
+            /* 替换所有 "7android" 为 "7android3gui" */                                \
+            size_t pos = 0;                                                            \
+            while ((pos = guiSig.find("7android", pos)) != std::string::npos) {        \
                 guiSig.insert(pos + 8, "3gui");                                        \
-                ClassName##__##MethodName = reinterpret_cast<decltype(ClassName##__##MethodName)>( \
-                    symbolMethod.Find(Handle, guiSig.c_str()));                        \
+                pos += 8 + 4; /* 跳过 "7android3gui" */                                \
             }                                                                          \
+            ClassName##__##MethodName = reinterpret_cast<decltype(ClassName##__##MethodName)>( \
+                symbolMethod.Find(Handle, guiSig.c_str()));                            \
         }                                                                              \
         if (nullptr == ClassName##__##MethodName) {                                    \
             __android_log_print(ANDROID_LOG_ERROR, "ImGui",                            \
