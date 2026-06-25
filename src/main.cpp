@@ -17,8 +17,15 @@
 
 #include "ANativeWindowCreator.h"
 
+// 覆盖 ANativeWindowCreator.h 中的 LOGI/LOGE，改用 stdout 输出
+#undef LOGI
+#undef LOGE
+#undef LOGW
+#undef LOGD
 #define LOGI(fmt, ...) fprintf(stdout, "[ImGui] " fmt "\n", ##__VA_ARGS__)
 #define LOGE(fmt, ...) fprintf(stderr, "[ImGui] " fmt "\n", ##__VA_ARGS__)
+#define LOGW(fmt, ...) fprintf(stderr, "[ImGui] " fmt "\n", ##__VA_ARGS__)
+#define LOGD(fmt, ...) fprintf(stdout, "[ImGui] " fmt "\n", ##__VA_ARGS__)
 
 // ============================================================
 // EGL / 窗口全局变量
@@ -45,88 +52,55 @@ static bool create_overlay_window(FunctionTable& fn) {
     fn.SCC_Construct(scc);
     LOGI("SurfaceComposerClient constructed");
 
-    // --- 2. 获取显示 Token ---
+    // --- 2. 获取显示 Token (通过包装函数) ---
     bool haveToken = false;
-    char tokenBuf[64] = {0};
+    void* displayToken = nullptr;
 
-    auto getToken = [&](const char* method) -> bool {
-        // 这里需要一个合适大小的结构来接收 IBinder
-        // 实际上 GetInternalDisplayToken 返回的是 sp<IBinder>
-        // 但在栈上构造太复杂，改用指针
-        return false;
-    };
-
-    // 使用 getPhysicalDisplayIds + getPhysicalDisplayToken
-    if (fn.SCC_GetPhysicalDisplayIds && fn.SCC_GetPhysicalDisplayToken) {
-        // 注意：GetPhysicalDisplayIds 返回 vector<PhysicalDisplayId>
-        // 我们需要调用它并获取返回的数组
-        // 这里使用 reinterpret_cast 技巧：调用返回 vector 的函数
-        typedef std::vector<stub::PhysicalDisplayId> (*GetIdsFunc)();
-        auto getIds = reinterpret_cast<GetIdsFunc>(fn.SCC_GetPhysicalDisplayIds);
-        auto ids = getIds();
-
-        if (!ids.empty()) {
-            LOGI("Found %zu physical display(s)", ids.size());
-
-            stub::PhysicalDisplayId id0 = ids[0];
-            // getPhysicalDisplayToken(uint64_t) -> sp<IBinder>
-            typedef stub::StrongPointer<void> (*GetTokenFunc)(uint64_t);
-            auto getToken = reinterpret_cast<GetTokenFunc>(fn.SCC_GetPhysicalDisplayToken);
-            auto tokenSP = getToken(id0.value);
-
-            if (tokenSP) {
+    // 首选: getPhysicalDisplayIds + getPhysicalDisplayToken
+    {
+        uint64_t physId = 0;
+        size_t count = 0;
+        if (fn.getPhysicalDisplayIds(&physId, &count)) {
+            LOGI("Found %zu physical display(s)", count);
+            if (fn.getPhysicalDisplayToken(physId, &displayToken)) {
                 LOGI("Got display token via getPhysicalDisplayToken");
                 haveToken = true;
-
-                // --- 3. 获取显示信息 ---
-                stub::DisplayInfo dinfo = {0};
-                if (fn.SCC_GetDisplayInfo) {
-                    // GetDisplayInfo(const sp<IBinder>&, DisplayInfo*)
-                    // 第一个参数是 const sp<IBinder>&，即 const StrongPointer<IBinder>&
-                    typedef int32_t (*GetInfoFunc)(void* /* const sp<IBinder>& */, void*);
-                    auto getInfo = reinterpret_cast<GetInfoFunc>(fn.SCC_GetDisplayInfo);
-                    int32_t ret = getInfo((void*)&tokenSP, (void*)&dinfo);
-                    LOGI("GetDisplayInfo returned %d: %ux%u", ret, dinfo.w, dinfo.h);
-                } else {
-                    LOGE("SCC_GetDisplayInfo not resolved");
-                }
-
-                fb_width  = dinfo.w > 0 ? dinfo.w : 1080;
-                fb_height = dinfo.h > 0 ? dinfo.h : 1920;
-                LOGI("Display resolution: %dx%d", fb_width, fb_height);
             }
         } else {
-            LOGE("getPhysicalDisplayIds returned empty list");
+            LOGE("getPhysicalDisplayIds failed");
         }
-    } else {
-        LOGE("GetPhysicalDisplayIds/Token not resolved");
     }
 
-    if (!haveToken) {
-        // 尝试 getInternalDisplayToken
-        if (fn.SCC_GetInternalDisplayToken) {
-            typedef stub::StrongPointer<void> (*TokenFunc)();
-            auto getToken = reinterpret_cast<TokenFunc>(fn.SCC_GetInternalDisplayToken);
-            auto token = getToken();
-            if (token) {
-                LOGI("Got display token via getInternalDisplayToken");
-                haveToken = true;
-
-                stub::DisplayInfo dinfo = {0};
-                if (fn.SCC_GetDisplayInfo) {
-                    typedef int32_t (*GetInfoFunc)(void*, void*);
-                    auto getInfo = reinterpret_cast<GetInfoFunc>(fn.SCC_GetDisplayInfo);
-                    getInfo((void*)&token, (void*)&dinfo);
-                }
-                fb_width  = dinfo.w > 0 ? dinfo.w : 1080;
-                fb_height = dinfo.h > 0 ? dinfo.h : 1920;
-            }
+    // 备选: getInternalDisplayToken
+    if (!haveToken && fn.SCC_GetInternalDisplayToken) {
+        char spBuf[sizeof(void*)] = {0};
+        // 通过 ABI 调用: 返回 sp<IBinder> 使用隐藏参数
+        typedef void (*RealTokenFn)(void*);
+        auto realFn = reinterpret_cast<RealTokenFn>(fn.SCC_GetInternalDisplayToken);
+        realFn((void*)spBuf);
+        displayToken = *(void**)spBuf;
+        if (displayToken) {
+            LOGI("Got display token via getInternalDisplayToken");
+            haveToken = true;
         }
     }
 
     if (!haveToken) {
         LOGE("Failed to get display token via any method");
         return false;
+    }
+
+    // --- 3. 获取显示信息 ---
+    {
+        stub::DisplayInfo dinfo = {0};
+        if (fn.getDisplayInfo(displayToken, &dinfo)) {
+            LOGI("DisplayInfo: %ux%u, fps=%.1f", dinfo.w, dinfo.h, dinfo.fps);
+        }
+        // 部分 Android 版本通过 SurfaceComposerClient::getDisplayInfo 获取尺寸
+        fb_width  = 1080;
+        fb_height = 1920;
+        // 尝试通过 ANativeWindow 获取真实尺寸
+        LOGI("Using resolution: %dx%d", fb_width, fb_height);
     }
 
     // --- 4. 创建 String8 ---
@@ -149,16 +123,19 @@ static bool create_overlay_window(FunctionTable& fn) {
     }
 
     uint32_t transformHint = 0;
-    // CreateSurface 返回 sp<SurfaceControl>
-    typedef void* (*CreateSurfaceFunc)(void* self, void* name,
+    // ABI: sp<SurfaceControl> createSurface(...) 使用隐藏参数返回
+    // void realFn(sp<SurfaceControl>* result, self, name, w, h, format, flags, parent, meta, hint)
+    char scSpBuf[sizeof(void*)] = {0};
+    typedef void (*CreateSurfaceABI)(void* result, void* self, void* name,
         uint32_t w, uint32_t h, int32_t format, uint32_t flags,
         void* parent, void* meta, uint32_t* hint);
-    auto createSurf = reinterpret_cast<CreateSurfaceFunc>(fn.SCC_CreateSurface);
-    void* scSP = createSurf(scc, str8, fb_width, fb_height,
+    auto createSurf = reinterpret_cast<CreateSurfaceABI>(fn.SCC_CreateSurface);
+    createSurf((void*)scSpBuf, scc, str8, fb_width, fb_height,
         1,  // PIXEL_FORMAT_RGBA_8888
         1,  // ISurfaceComposerClient::eFXSurfaceBufferState
         nullptr, metaBuf, &transformHint);
 
+    void* scSP = *(void**)scSpBuf;
     if (!scSP) {
         LOGE("createSurface returned null");
         return false;
@@ -166,33 +143,33 @@ static bool create_overlay_window(FunctionTable& fn) {
     LOGI("SurfaceControl created");
 
     // --- 7. 设置 Transaction ---
-    struct SurfaceControlDeleter {
-        stub::StrongPointer<void> sp;
-        char padding[192 - sizeof(stub::StrongPointer<void>)] = {0};
-    };
-    // scSP 是一个 StrongPointer<SurfaceControl>，它的地址就是 SurfaceControl 的地址
-    // 但是我们无法确定 StrongPointer 的布局，所以直接用原始指针
-
     char txnBuf[512] = {0};
     if (fn.Txn_Construct)
         fn.Txn_Construct(txnBuf);
 
+    // SetLayer/SetTrustedOverlay 参数: const sp<SurfaceControl>&
+    // ABI: 传入 sp<SurfaceControl>* (即指向 scSpBuf 的指针)
     if (fn.Txn_SetLayer)
-        fn.Txn_SetLayer(txnBuf, scSP, INT32_MAX);
+        fn.Txn_SetLayer(txnBuf, (void*)scSpBuf, INT32_MAX);
     if (fn.Txn_SetTrustedOverlay)
-        fn.Txn_SetTrustedOverlay(txnBuf, scSP, true);
+        fn.Txn_SetTrustedOverlay(txnBuf, (void*)scSpBuf, true);
     if (fn.Txn_Apply)
         fn.Txn_Apply(txnBuf, true, true);
 
     // --- 8. 获取 ANativeWindow ---
+    // SC_GetSurface 返回 sp<Surface>，ABI 隐藏参数
     if (!fn.SC_GetSurface) {
         LOGE("SC_GetSurface not resolved");
         return false;
     }
-    typedef void* (*GetSurfFunc)(void*);
-    auto getSf = reinterpret_cast<GetSurfFunc>(fn.SC_GetSurface);
-    void* surface = getSf(scSP);
+    char surfSpBuf[sizeof(void*)] = {0};
+    typedef void (*GetSurfaceABI)(void* result, void* self);
+    auto getSurf = reinterpret_cast<GetSurfaceABI>(fn.SC_GetSurface);
+    // SC_GetSurface 的 this = SurfaceControl*, sp<> 中存的就是裸指针
+    void* surfaceControlObj = *(void**)scSpBuf;
+    getSurf((void*)surfSpBuf, surfaceControlObj);
 
+    void* surface = *(void**)surfSpBuf;
     if (!surface) {
         LOGE("SC_GetSurface returned null");
         return false;
