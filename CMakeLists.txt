@@ -40,6 +40,7 @@ target_link_libraries(${TARGET} PRIVATE
     GLESv3
     android
     log
+    dl
 )
 
 # 静态链接 C++ 运行时，减少设备依赖
