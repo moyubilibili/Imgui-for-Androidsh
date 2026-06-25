@@ -52,56 +52,30 @@ static bool create_overlay_window(FunctionTable& fn) {
     fn.SCC_Construct(scc);
     LOGI("SurfaceComposerClient constructed");
 
-    // --- 2. 获取显示 Token (通过包装函数) ---
-    bool haveToken = false;
-    void* displayToken = nullptr;
-
-    // 首选: getPhysicalDisplayIds + getPhysicalDisplayToken
+    // --- 2. 获取显示 Token ---
     {
         uint64_t physId = 0;
         size_t count = 0;
         if (fn.getPhysicalDisplayIds(&physId, &count)) {
             LOGI("Found %zu physical display(s)", count);
-            if (fn.getPhysicalDisplayToken(physId, &displayToken)) {
-                LOGI("Got display token via getPhysicalDisplayToken");
-                haveToken = true;
+            void* displayToken = nullptr;
+            if (!fn.getPhysicalDisplayToken(physId, &displayToken) || !displayToken) {
+                LOGE("getPhysicalDisplayToken failed");
+                return false;
             }
+            LOGI("Got display token via getPhysicalDisplayToken (token=%p)", displayToken);
         } else {
             LOGE("getPhysicalDisplayIds failed");
+            return false;
         }
     }
 
-    // 备选: getInternalDisplayToken
-    if (!haveToken && fn.SCC_GetInternalDisplayToken) {
-        char spBuf[sizeof(void*)] = {0};
-        // 通过 ABI 调用: 返回 sp<IBinder> 使用隐藏参数
-        typedef void (*RealTokenFn)(void*);
-        auto realFn = reinterpret_cast<RealTokenFn>(fn.SCC_GetInternalDisplayToken);
-        realFn((void*)spBuf);
-        displayToken = *(void**)spBuf;
-        if (displayToken) {
-            LOGI("Got display token via getInternalDisplayToken");
-            haveToken = true;
-        }
-    }
-
-    if (!haveToken) {
-        LOGE("Failed to get display token via any method");
-        return false;
-    }
-
-    // --- 3. 获取显示信息 ---
-    {
-        stub::DisplayInfo dinfo = {0};
-        if (fn.getDisplayInfo(displayToken, &dinfo)) {
-            LOGI("DisplayInfo: %ux%u, fps=%.1f", dinfo.w, dinfo.h, dinfo.fps);
-        }
-        // 部分 Android 版本通过 SurfaceComposerClient::getDisplayInfo 获取尺寸
-        fb_width  = 1080;
-        fb_height = 1920;
-        // 尝试通过 ANativeWindow 获取真实尺寸
-        LOGI("Using resolution: %dx%d", fb_width, fb_height);
-    }
+    // --- 3. 分辨率 ---
+    // getDisplayInfo 在 Android 15+ 中不存在，使用默认分辨率
+    // ANativeWindow 创建后可以通过 ANativeWindow_getWidth/Height 获取真实尺寸
+    fb_width  = 1080;
+    fb_height = 1920;
+    LOGI("Using default resolution: %dx%d (adjust after window creation)", fb_width, fb_height);
 
     // --- 4. 创建 String8 ---
     char str8Buf[128] = {0};
@@ -151,8 +125,6 @@ static bool create_overlay_window(FunctionTable& fn) {
     // ABI: 传入 sp<SurfaceControl>* (即指向 scSpBuf 的指针)
     if (fn.Txn_SetLayer)
         fn.Txn_SetLayer(txnBuf, (void*)scSpBuf, INT32_MAX);
-    if (fn.Txn_SetTrustedOverlay)
-        fn.Txn_SetTrustedOverlay(txnBuf, (void*)scSpBuf, true);
     if (fn.Txn_Apply)
         fn.Txn_Apply(txnBuf, true, true);
 
@@ -177,7 +149,11 @@ static bool create_overlay_window(FunctionTable& fn) {
 
     g_window = reinterpret_cast<ANativeWindow*>(surface);
     ANativeWindow_acquire(g_window);
-    LOGI("ANativeWindow: %p (%dx%d)", (void*)g_window, fb_width, fb_height);
+
+    // 通过 ANativeWindow 获取实际分辨率
+    fb_width  = ANativeWindow_getWidth(g_window);
+    fb_height = ANativeWindow_getHeight(g_window);
+    LOGI("ANativeWindow: %p (actual: %dx%d)", (void*)g_window, fb_width, fb_height);
     return true;
 }
 

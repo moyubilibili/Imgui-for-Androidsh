@@ -68,31 +68,18 @@ static void dump_libgui_symbols() {
     const SymPair candidates[] = {
         {"android::", "_ZN7android21SurfaceComposerClientC2Ev"},
         {"gui::",     "_ZN7android3gui21SurfaceComposerClientC2Ev"},
-        {"android::", "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjijRKNS_2spINS_7IBinderEEENS_3gui13LayerMetadataEPj"},
-        {"gui::",     "_ZN7android3gui21SurfaceComposerClient13createSurfaceERKNS_7String8EjjijRKNS_2spINS_7IBinderEEENS_3gui13LayerMetadataEPj"},
-        {"android::", "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjiiRKNS_2spINS_7IBinderEEENS_3gui13LayerMetadataEPj"},
-        {"android::", "_ZN7android21SurfaceComposerClient23getInternalDisplayTokenEv"},
-        {"gui::",     "_ZN7android3gui21SurfaceComposerClient23getInternalDisplayTokenEv"},
+        {"[ii] ",     "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjiiRKNS_2spINS_7IBinderEEENS_3gui13LayerMetadataEPj"},
+        {"[ij] ",     "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjijRKNS_2spINS_7IBinderEEENS_3gui13LayerMetadataEPj"},
         {"android::", "_ZN7android21SurfaceComposerClient21getPhysicalDisplayIdsEv"},
-        {"gui::",     "_ZN7android3gui21SurfaceComposerClient21getPhysicalDisplayIdsEv"},
         {"android::", "_ZN7android21SurfaceComposerClient23getPhysicalDisplayTokenENS_17PhysicalDisplayIdE"},
-        {"gui::",     "_ZN7android3gui21SurfaceComposerClient23getPhysicalDisplayTokenENS_17PhysicalDisplayIdE"},
-        {"android::", "_ZN7android21SurfaceComposerClient14getDisplayInfoERKNS_2spINS_7IBinderEEEPNS_2ui11DisplayInfoE"},
-        {"gui::",     "_ZN7android3gui21SurfaceComposerClient14getDisplayInfoERKNS_2spINS_7IBinderEEEPNS_2ui11DisplayInfoE"},
-        {"android::", "_ZNK7android14SurfaceControl10getSurfaceEv"},
-        {"gui::",     "_ZNK7android3gui14SurfaceControl10getSurfaceEv"},
         {"android::", "_ZN7android21SurfaceComposerClient11TransactionC2Ev"},
-        {"gui::",     "_ZN7android3gui21SurfaceComposerClient11TransactionC2Ev"},
         {"android::", "_ZN7android21SurfaceComposerClient11Transaction5applyEbb"},
-        {"gui::",     "_ZN7android3gui21SurfaceComposerClient11Transaction5applyEbb"},
         {"android::", "_ZN7android21SurfaceComposerClient11Transaction8setLayerERKNS_2spINS_14SurfaceControlEEEi"},
-        {"gui::",     "_ZN7android3gui21SurfaceComposerClient11Transaction8setLayerERKNS_2spINS_14SurfaceControlEEEi"},
-        {"android::", "_ZN7android21SurfaceComposerClient11Transaction8setTrustedOverlayERKNS_2spINS_14SurfaceControlEEEb"},
-        {"gui::",     "_ZN7android3gui21SurfaceComposerClient11Transaction8setTrustedOverlayERKNS_2spINS_14SurfaceControlEEEb"},
-        {"android::", "_ZN7android13LayerMetadataC2Ev"},
         {"gui::",     "_ZN7android3gui13LayerMetadataC2Ev"},
         {"android::", "_ZN7android7String8C2EPKc"},
-        {"gui::",     "_ZN7android3gui7String8C2EPKc"},
+        {"[const]",   "_ZNK7android14SurfaceControl10getSurfaceEv"},
+        {"[non-const]","_ZN7android14SurfaceControl10getSurfaceEv"},
+        {"[sc-gui]","_ZN7android3gui14SurfaceControl10getSurfaceEv"},
         {"and::RefBase","_ZNK7android7RefBase9incStrongEPKv"},
         {"and::RefBase","_ZNK7android7RefBase9decStrongEPKv"},
     };
@@ -146,18 +133,13 @@ struct FunctionTable {
         uint32_t w, uint32_t h, int32_t format, uint32_t flags,
         void* parent, void* meta, uint32_t* hint) = nullptr;
 
-    void* (*SCC_GetInternalDisplayToken)() = nullptr;
-
     // GetPhysicalDisplayIds() -> std::vector<PhysicalDisplayId>
-    // 需要特殊处理 - 我们在栈上分配 vector 区域并调用函数
-    // 这里存原始函数指针，调用时通过 wrapper
+    // GetPhysicalDisplayToken(uint64_t) -> sp<IBinder>
     void* (*SCC_GetPhysicalDisplayIds_raw)() = nullptr;
     void* (*SCC_GetPhysicalDisplayToken_raw)(uint64_t) = nullptr;
-    int32_t (*SCC_GetDisplayInfo_raw)(void*, void*) = nullptr;
 
     void (*Txn_Construct)(void* self) = nullptr;
     void* (*Txn_SetLayer)(void* self, void* sc, int32_t z) = nullptr;
-    void* (*Txn_SetTrustedOverlay)(void* self, void* sc, bool trusted) = nullptr;
     int32_t (*Txn_Apply)(void* self, bool sync, bool oneWay) = nullptr;
 
     void* (*SC_GetSurface)(void* self) = nullptr;
@@ -215,18 +197,6 @@ struct FunctionTable {
         return false;
     }
 
-    // 包装函数：获取显示信息
-    bool getDisplayInfo(void* token, stub::DisplayInfo* info) {
-        if (!SCC_GetDisplayInfo_raw) return false;
-        // GetDisplayInfo(const sp<IBinder>&, DisplayInfo*)
-        // sp<IBinder> 作为 const 引用传递，本质上是指向指针的指针
-        typedef int32_t (*RealGetInfo)(const void** tokenRef, void* info);
-        auto realFn = reinterpret_cast<RealGetInfo>(SCC_GetDisplayInfo_raw);
-        const void* tokenPtr = token;
-        int32_t ret = realFn(&tokenPtr, (void*)info);
-        return ret == 0;
-    }
-
     bool Init() {
         std::string verStr(128, 0);
         verStr.resize(__system_property_get("ro.build.version.release", verStr.data()));
@@ -256,38 +226,33 @@ struct FunctionTable {
         RESOLVE(String8_Destroy,   "_ZN7android7String8D2Ev");
 
         RESOLVE(SCC_Construct, "_ZN7android21SurfaceComposerClientC2Ev");
-        // CreateSurface 的两种 flags 类型
-        RESOLVE(SCC_CreateSurface, "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjijRKNS_2spINS_7IBinderEEENS_3gui13LayerMetadataEPj");
+        // CreateSurface: 先试 ii 变体，不行再试 ij
+        RESOLVE(SCC_CreateSurface, "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjiiRKNS_2spINS_7IBinderEEENS_3gui13LayerMetadataEPj");
         if (!SCC_CreateSurface)
-            RESOLVE(SCC_CreateSurface, "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjiiRKNS_2spINS_7IBinderEEENS_3gui13LayerMetadataEPj");
-
-        RESOLVE(SCC_GetInternalDisplayToken,     "_ZN7android21SurfaceComposerClient23getInternalDisplayTokenEv");
+            RESOLVE(SCC_CreateSurface, "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjijRKNS_2spINS_7IBinderEEENS_3gui13LayerMetadataEPj");
+        // getInternalDisplayToken 和 getDisplayInfo 在 Android 16+ 不存在
         RESOLVE(SCC_GetPhysicalDisplayIds_raw,   "_ZN7android21SurfaceComposerClient21getPhysicalDisplayIdsEv");
         RESOLVE(SCC_GetPhysicalDisplayToken_raw, "_ZN7android21SurfaceComposerClient23getPhysicalDisplayTokenENS_17PhysicalDisplayIdE");
-        RESOLVE(SCC_GetDisplayInfo_raw,          "_ZN7android21SurfaceComposerClient14getDisplayInfoERKNS_2spINS_7IBinderEEEPNS_2ui11DisplayInfoE");
         RESOLVE(Txn_Construct,                   "_ZN7android21SurfaceComposerClient11TransactionC2Ev");
         RESOLVE(Txn_SetLayer,                    "_ZN7android21SurfaceComposerClient11Transaction8setLayerERKNS_2spINS_14SurfaceControlEEEi");
-        RESOLVE(Txn_SetTrustedOverlay,           "_ZN7android21SurfaceComposerClient11Transaction17setTrustedOverlayERKNS_2spINS_14SurfaceControlEEEb");
         RESOLVE(Txn_Apply,                       "_ZN7android21SurfaceComposerClient11Transaction5applyEbb");
+        // SC_GetSurface: 先试 const 版本，不行再试非 const
         RESOLVE(SC_GetSurface,                   "_ZNK7android14SurfaceControl10getSurfaceEv");
+        if (!SC_GetSurface)
+            RESOLVE(SC_GetSurface,               "_ZN7android14SurfaceControl10getSurfaceEv");
+        if (!SC_GetSurface)
+            RESOLVE(SC_GetSurface,               "_ZN7android3gui14SurfaceControl10getSurfaceEv");
         RESOLVE(SC_Validate,                     "_ZNK7android14SurfaceControl8validateEv");
         RESOLVE(SC_Disconnect,                   "_ZN7android14SurfaceControl10disconnectEv");
-        RESOLVE(LayerMeta_Construct,             "_ZN7android13LayerMetadataC2Ev");
-        RESOLVE(LayerMeta_SetInt32,              "_ZN7android13LayerMetadata8setInt32Eji");
+        RESOLVE(LayerMeta_Construct,             "_ZN7android3gui13LayerMetadataC2Ev");
+        RESOLVE(LayerMeta_SetInt32,              "_ZN7android3gui13LayerMetadata8setInt32Eji");
 
-        if (!LayerMeta_Construct)
-            RESOLVE(LayerMeta_Construct,         "_ZN7android3gui13LayerMetadataC2Ev");
-        if (!LayerMeta_SetInt32)
-            RESOLVE(LayerMeta_SetInt32,          "_ZN7android3gui13LayerMetadata8setInt32Eji");
-
-        LOGI("Symbols: Construct=%s CreateSurface=%s GetToken=%s GetPhysIds=%s GetDispInfo=%s Txn=%s SC_GetSurface=%s LayerMeta=%s S8=%s",
+        LOGI("Symbols: Construct=%s CreateSurface=%s GetPhysIds=%s SC_GetSurface=%s&nbsp;&nbsp;Txn=%s LayerMeta=%s S8=%s",
             SCC_Construct?"OK":"--",
             SCC_CreateSurface?"OK":"--",
-            SCC_GetInternalDisplayToken?"OK":"--",
             SCC_GetPhysicalDisplayIds_raw?"OK":"--",
-            SCC_GetDisplayInfo_raw?"OK":"--",
-            Txn_Construct?"OK":"--",
             SC_GetSurface?"OK":"--",
+            Txn_Construct?"OK":"--",
             LayerMeta_Construct?"OK":"--",
             String8_Construct?"OK":"--");
 
